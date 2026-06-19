@@ -571,10 +571,10 @@ template <
     short bits>
 struct QuantizedBlockLoader {
   static_assert(
-      BCOLS <= group_size,
-      "The group size should be larger than the columns");
+      BCOLS <= group_size || BCOLS % group_size == 0,
+      "The columns should fit within a group or span whole groups");
   static_assert(
-      group_size % BCOLS == 0,
+      BCOLS <= group_size ? group_size % BCOLS == 0 : true,
       "The group size should be divisible by the columns");
   static_assert(
       bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
@@ -587,6 +587,7 @@ struct QuantizedBlockLoader {
   MLX_MTL_CONST short n_reads =
       (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
   MLX_MTL_CONST short group_steps = group_size / BCOLS;
+  MLX_MTL_CONST short groups_per_tile = BCOLS / group_size;
 
   const int src_ld;
   const int tile_stride;
@@ -630,9 +631,11 @@ struct QuantizedBlockLoader {
       return;
     }
 
-    T scale = *scales;
-    T bias = *biases;
     for (int i = 0; i < n_reads; i++) {
+      const int group_offset =
+          (BCOLS > group_size) ? ((bj + i) * pack_factor) / group_size : 0;
+      T scale = scales[group_offset];
+      T bias = biases[group_offset];
       dequantize<T, pack_factor, bits>(
           src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
     }
@@ -657,9 +660,11 @@ struct QuantizedBlockLoader {
       return;
     }
 
-    T scale = *scales;
-    T bias = *biases;
     for (int i = 0; i < n_reads; i++) {
+      const int group_offset =
+          (BCOLS > group_size) ? ((bj + i) * pack_factor) / group_size : 0;
+      T scale = scales[group_offset];
+      T bias = biases[group_offset];
       dequantize<T, pack_factor, bits>(
           (device uint8_t*)(src + i * bytes_per_pack),
           scale,
@@ -671,7 +676,10 @@ struct QuantizedBlockLoader {
   void next() {
     src += tile_stride;
     if (reduction_dim == 1) {
-      if (group_steps > 1) {
+      if (BCOLS > group_size) {
+        scales += groups_per_tile;
+        biases += groups_per_tile;
+      } else if (group_steps > 1) {
         group_step_cnt++;
         if (group_step_cnt == group_steps) {
           group_step_cnt = 0;
@@ -702,7 +710,7 @@ METAL_FUNC void qmv_quad_impl(
     uint quad_gid [[quadgroup_index_in_threadgroup]],
     uint quad_lid [[thread_index_in_quadgroup]]) {
   constexpr int quads_per_simd = SIMD_SIZE / QUAD_SIZE;
-  constexpr int pack_factor = 32 / bits;
+  constexpr int pack_factor = get_pack_factor<bits, 32>();
   constexpr int values_per_thread = D / QUAD_SIZE;
   constexpr int packs_per_thread = values_per_thread / pack_factor;
   constexpr int scale_step_per_thread = group_size / values_per_thread;

@@ -27,6 +27,33 @@ public protocol Quantized: Module {
     var mode: QuantizationMode { get }
 }
 
+private func quantizedStorageCount(for valueCount: Int, bits: Int) -> Int {
+    precondition((valueCount * bits).isMultiple(of: 32))
+    return valueCount * bits / 32
+}
+
+private func quantizedValueCount(for storageCount: Int, bits: Int) -> Int {
+    precondition((storageCount * 32).isMultiple(of: bits))
+    return storageCount * 32 / bits
+}
+
+private func quantizedPlaceholderArrays(
+    weightShape: [Int], groupSize: Int, bits: Int, dtype: DType, mode: QuantizationMode
+) -> (weight: MLXArray, scales: MLXArray, biases: MLXArray?) {
+    precondition(!weightShape.isEmpty)
+    var quantizedWeightShape = weightShape
+    quantizedWeightShape[quantizedWeightShape.count - 1] = quantizedStorageCount(
+        for: quantizedWeightShape[quantizedWeightShape.count - 1], bits: bits)
+
+    var scalesShape = weightShape
+    scalesShape[scalesShape.count - 1] /= groupSize
+
+    let quantizedWeight = MLXArray.zeros(quantizedWeightShape, dtype: .uint32)
+    let scales = MLXArray.ones(scalesShape, dtype: dtype)
+    let biases = mode == .affine ? MLXArray.zeros(scalesShape, dtype: dtype) : nil
+    return (quantizedWeight, scales, biases)
+}
+
 /// Quantize any ``Quantizable`` layer that is not already quantized.
 public func quantizeSingle(
     layer: Module, groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode = .affine
@@ -162,7 +189,7 @@ open class QuantizedEmbedding: Embedding, Quantized {
 
     open override var shape: (Int, Int) {
         let (embeddingCount, dimensions) = super.shape
-        return (embeddingCount, dimensions * 32 / self.bits)
+        return (embeddingCount, quantizedValueCount(for: dimensions, bits: self.bits))
     }
 
     convenience public init(
@@ -190,8 +217,14 @@ open class QuantizedEmbedding: Embedding, Quantized {
         self.bits = bits
         self.mode = mode
 
-        let (quantizedWeight, scales, biases) = MLX.quantized(
-            weight, groupSize: groupSize, bits: bits, mode: mode)
+        let (quantizedWeight, scales, biases) =
+            if groupSize == 16 {
+                quantizedPlaceholderArrays(
+                    weightShape: weight.shape, groupSize: groupSize, bits: bits, dtype: weight.dtype,
+                    mode: mode)
+            } else {
+                MLX.quantized(weight, groupSize: groupSize, bits: bits, mode: mode)
+            }
 
         self.scales = scales
         self.biases = biases
@@ -246,7 +279,7 @@ open class QuantizedLinear: Linear, Quantized {
 
     open override var shape: (Int, Int) {
         let shape = weight.shape2
-        return (shape.0, shape.1 * 32 / bits)
+        return (shape.0, quantizedValueCount(for: shape.1, bits: bits))
     }
 
     /// Applies an affine transformation to the input using a quantized weight matrix.
@@ -298,8 +331,14 @@ open class QuantizedLinear: Linear, Quantized {
         self.bits = bits
         self.mode = mode
 
-        let (quantizedWeight, scales, biases) = MLX.quantized(
-            weight, groupSize: groupSize, bits: bits)
+        let (quantizedWeight, scales, biases) =
+            if groupSize == 16 {
+                quantizedPlaceholderArrays(
+                    weightShape: weight.shape, groupSize: groupSize, bits: bits, dtype: weight.dtype,
+                    mode: mode)
+            } else {
+                MLX.quantized(weight, groupSize: groupSize, bits: bits, mode: mode)
+            }
 
         self.scales = scales
         self.biases = biases
